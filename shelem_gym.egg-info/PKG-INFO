@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: shelem-gym
+Version: 0.1.0
+Summary: Multi-agent reinforcement learning environment for the Persian card game Shelem
+Author: Zander Mao
+Requires-Dist: numpy
+Requires-Dist: gymnasium>=0.28
+Requires-Dist: pettingzoo>=1.24
+Provides-Extra: rllib
+Requires-Dist: ray[rllib]>=2.8; extra == "rllib"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"

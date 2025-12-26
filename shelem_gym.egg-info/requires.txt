@@ -1,0 +1,10 @@
+numpy
+gymnasium>=0.28
+pettingzoo>=1.24
+
+[dev]
+pytest
+black
+
+[rllib]
+ray[rllib]>=2.8

@@ -3,17 +3,20 @@ from dataclasses import dataclass
 import numpy as np
 from gymnasium import spaces
 from pettingzoo import AECEnv
-from pettingzoo.utils import agent_selector
+from pettingzoo.utils import agent_selector, wrappers
 
-SUITS = 4
-RANKS = 13
-NUM_CARDS = 52
+from shelem_gym.observation.local import build_local_obs
+from shelem_gym.rules.standard import legal_actions, resolve_trick_winner
+from shelem_gym.rules.scoring import score_game
+from shelem_gym.utils.cards import NUM_CARDS
 
-def card_id(suit: int, rank: int) -> int:
-    return suit * 13 + rank  # rank: 0..12
 
-def suit_of(cid: int) -> int:
-    return cid // 13
+# Matching pettingzoo conventions
+def shelem_v0(**kwargs):
+    env = ShelemAEC(**kwargs)
+    env = wrappers.AssertOutOfBoundsWrapper(env)
+    env = wrappers.OrderEnforcingWrapper(env)
+    return env
 
 @dataclass
 class ShelemConfig:
@@ -34,8 +37,19 @@ class ShelemAEC(AECEnv):
         # Fixed action space: play any of 52 card ids
         self._action_spaces = {a: spaces.Discrete(NUM_CARDS) for a in self.possible_agents}
 
-        # Observation: dict with vector + mask
-        obs_dim = 52 + 52 + 4*52 + 4 + 4 + 4 + 2  # example design
+        dummy = build_local_obs(
+            player_idx=0,
+            hands=[set() for _ in range(4)],
+            played=np.zeros(NUM_CARDS, np.int8),
+            current_trick=[],
+            trump=0,
+            leader=0,
+            turn=0,
+            team_tricks=np.zeros(2, np.int32),
+            num_tricks=self.cfg.num_tricks,
+        )
+        obs_dim = int(dummy.shape[0])
+
         self._observation_spaces = {
             a: spaces.Dict({
                 "obs": spaces.Box(0.0, 1.0, shape=(obs_dim,), dtype=np.float32),
@@ -69,6 +83,7 @@ class ShelemAEC(AECEnv):
 
         self.agents = self.possible_agents[:]
         self.rewards = {a: 0.0 for a in self.agents}
+        self._cumulative_rewards = {a: 0.0 for a in self.agents}
         self.terminations = {a: False for a in self.agents}
         self.truncations = {a: False for a in self.agents}
         self.infos = {a: {} for a in self.agents}
@@ -96,64 +111,36 @@ class ShelemAEC(AECEnv):
 
         self.agent_selection = self._agent_selector.agent_selection
 
-    def observe(self, agent):
-        idx = self.possible_agents.index(agent)
-
-        hand_vec = np.zeros(52, dtype=np.float32)
-        for c in self.hands[idx]:
-            hand_vec[c] = 1.0
-
-        played_vec = self.played.astype(np.float32)
-
-        trick_mat = np.zeros((4,52), dtype=np.float32)
-        for (pidx, cid) in self.current_trick:
-            trick_mat[pidx, cid] = 1.0
-
-        trump_vec = np.zeros(4, dtype=np.float32)
-        trump_vec[self.trump] = 1.0
-
-        leader_vec = np.zeros(4, dtype=np.float32)
-        leader_vec[self.leader] = 1.0
-
-        turn_vec = np.zeros(4, dtype=np.float32)
-        turn_vec[self.turn] = 1.0
-
-        score_vec = np.array([
-            self.team_tricks[0] / self.cfg.num_tricks,
-            self.team_tricks[1] / self.cfg.num_tricks,
-        ], dtype=np.float32)
-
-        obs = np.concatenate([
-            hand_vec,
-            played_vec,
-            trick_mat.reshape(-1),
-            trump_vec,
-            leader_vec,
-            turn_vec,
-            score_vec
-        ], axis=0)
-
-        mask = self._legal_action_mask(idx)
-
-        return {"obs": obs, "action_mask": mask}
 
     def _legal_action_mask(self, idx: int) -> np.ndarray:
         mask = np.zeros(NUM_CARDS, dtype=np.int8)
-        hand = self.hands[idx]
-
-        if len(self.current_trick) == 0:
-            for c in hand:
-                mask[c] = 1
-            return mask
-
-        led_suit = suit_of(self.current_trick[0][1])
-        follow = [c for c in hand if suit_of(c) == led_suit]
-        playable = follow if len(follow) > 0 else list(hand)
-        for c in playable:
+        for c in legal_actions(self.hands[idx], self.current_trick):
             mask[c] = 1
         return mask
 
-    def step(self, action: int):
+    def observe(self, agent):
+        idx = self.possible_agents.index(agent)
+
+        obs = build_local_obs(
+            player_idx=idx,
+            hands=self.hands,
+            played=self.played,
+            current_trick=self.current_trick,
+            trump=self.trump,
+            leader=self.leader,
+            turn=self.turn,
+            team_tricks=self.team_tricks,
+            num_tricks=self.cfg.num_tricks,
+        )
+
+        mask = self._legal_action_mask(idx)
+        return {"obs": obs, "action_mask": mask}
+
+    def step(self, action):
+        # Reset Rewards
+        for a in self.agents:
+            self.rewards[a] = 0.0
+
         agent = self.agent_selection
         idx = self.possible_agents.index(agent)
 
@@ -172,7 +159,7 @@ class ShelemAEC(AECEnv):
 
         # If trick complete, resolve winner
         if len(self.current_trick) == 4:
-            winner = self._resolve_trick_winner()
+            winner = resolve_trick_winner(self.current_trick, self.trump)
             self.tricks_won[winner] += 1
             team = 0 if winner in (0,2) else 1
             self.team_tricks[team] += 1
@@ -193,6 +180,8 @@ class ShelemAEC(AECEnv):
             # end condition: no cards left
             if all(len(h) == 0 for h in self.hands):
                 self._end_game()
+                self._accumulate_rewards()
+                return
 
             # move selector to new leader
             while self._agent_selector.agent_selection != self.agents[self.turn]:
@@ -202,41 +191,25 @@ class ShelemAEC(AECEnv):
             # next player in order
             self.turn = (self.turn + 1) % 4
             self.agent_selection = self._agent_selector.next()
-
-    def _resolve_trick_winner(self) -> int:
-        led_suit = suit_of(self.current_trick[0][1])
-
-        # Trick-taking ranking: trump beats non-trump; otherwise follow led suit
-        def card_key(pidx_cid):
-            pidx, cid = pidx_cid
-            s = suit_of(cid)
-            is_trump = (s == self.trump)
-            is_led = (s == led_suit)
-            rank = cid % 13
-            # Higher rank should win; map rank order as you like (A high)
-            # Here: 0..12; treat Ace (12) high if you encode that way.
-            return (is_trump, is_led, rank)
-
-        # winner is max by key (tuple comparison)
-        return max(self.current_trick, key=card_key)[0]
+        self._accumulate_rewards()
 
     def _end_game(self):
-        # terminal rewards if not shaping:
-        if not self.cfg.shaped_rewards:
-            if self.team_tricks[0] > self.team_tricks[1]:
-                win_team = 0
-            elif self.team_tricks[1] > self.team_tricks[0]:
-                win_team = 1
-            else:
-                win_team = -1
+        result = score_game(self.team_tricks)
 
+        if not self.cfg.shaped_rewards:
             for a in self.agents:
                 aidx = self.possible_agents.index(a)
-                if win_team == -1:
+                team = 0 if aidx in (0,2) else 1
+
+                if result == -1:
                     self.rewards[a] = 0.0
                 else:
-                    same_team = (aidx in (0,2)) == (win_team == 0)
-                    self.rewards[a] = 1.0 if same_team else -1.0
+                    self.rewards[a] = 1.0 if team == result else -1.0
 
         for a in self.agents:
             self.terminations[a] = True
+            self.infos[a].update({
+                "team_tricks": self.team_tricks.copy(),
+                "winner": int(result)
+            })
+        
